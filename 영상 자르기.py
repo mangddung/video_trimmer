@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, re, json, subprocess, threading, shutil, time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +20,10 @@ DEFAULT_CORES = max(1, TOTAL_CORES // 2)
 def run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
 
+def is_tool_available(name: str) -> bool:
+    """Checks whether `name` is on PATH and is executable."""
+    return shutil.which(name) is not None
+
 def ffprobe_get_chapters(video: Path) -> List[Dict]:
     cmd = [FFPROBE_BIN, "-v", "error", "-print_format", "json", "-show_chapters", str(video)]
     try:
@@ -33,6 +37,26 @@ def ffprobe_get_chapters(video: Path) -> List[Dict]:
         return sorted(chaps, key=lambda x: x["start"])
     except:
         return []
+
+def ffprobe_get_audio_streams(video: Path) -> List[int]:
+    """Returns a list of 0-based audio stream indices for FFmpeg mapping (e.g., 0, 1, 2...)."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-print_format", "json", "-show_streams", str(video)]
+    try:
+        res = run(cmd)
+        data = json.loads(res.stdout or "{}")
+        audio_stream_indices = []
+        audio_counter = 0
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                # For FFmpeg mapping (e.g., -map 0:a:0), we need the 0-based index of the audio stream
+                # as it appears in the sequence of audio streams within the file.
+                audio_stream_indices.append(audio_counter)
+                audio_counter += 1
+        return audio_stream_indices
+    except Exception as e:
+        print(f"Error getting audio streams: {e}")
+        return []
+
 
 def parse_pbf(pbf_path: Path) -> List[Dict]:
     markers = []
@@ -85,12 +109,16 @@ class VideoToolkitApp(tk.Tk):
         self.start_time = 0
         self.conversion_thread: threading.Thread | None = None
         self.mode_frame = None # Initialize mode_frame here
+        self.audio_track_vars: Dict[int, tk.BooleanVar] = {} # Store BooleanVars for audio tracks
+        self.audio_track_checkboxes: List[ttk.Checkbutton] = [] # Store checkbox widgets for easy clearing
+        self.audio_track_label = None # To store the "오디오 트랙 선택:" label
 
         self._build()
         self.mode.trace_add('write', lambda *args: self._update_mode_ui())
-        self.trim_strategy.trace_add('write', lambda *args: self._on_file_select())
+        # Removed the trace for trim_strategy to avoid re-rendering audio options
+        # self.trim_strategy.trace_add('write', lambda *args: self._on_file_select()) 
         self.between_only.trace_add('write', lambda *args: self._on_file_select())
-        self.trim_audio.trace_add('write', lambda *args: self._on_file_select())
+        self.trim_audio.trace_add('write', self._on_trim_audio_toggle) # New handler for audio toggle
         self._refresh_list()
 
     def _build(self):
@@ -121,7 +149,20 @@ class VideoToolkitApp(tk.Tk):
         ttk.Radiobutton(self.trim_fr, text="챕터 기준만", variable=self.trim_strategy, value="chapter").pack(anchor="w")
         ttk.Radiobutton(self.trim_fr, text="교차(PBF+챕터)", variable=self.trim_strategy, value="both").pack(anchor="w")
         ttk.Checkbutton(self.trim_fr, text="챕터 사이만", variable=self.between_only).pack(anchor="w")
-        ttk.Checkbutton(self.trim_fr, text="오디오 트랙 유지", variable=self.trim_audio).pack(anchor="w")
+        
+        # Audio options frame - now a separate LabelFrame
+        self.audio_config_fr = ttk.LabelFrame(right, text="오디오 옵션")
+        self.audio_config_fr.pack(fill="x", pady=(10,0))
+        ttk.Checkbutton(self.audio_config_fr, text="오디오 트랙 유지", variable=self.trim_audio).pack(anchor="w")
+        
+        # Container for dynamic audio track checkboxes
+        self.audio_track_checkbox_container_fr = ttk.Frame(self.audio_config_fr)
+        self.audio_track_checkbox_container_fr.pack(anchor="w", fill="x", pady=(5,0))
+        
+        # Create the "오디오 트랙 선택:" label once
+        self.audio_track_label = ttk.Label(self.audio_track_checkbox_container_fr, text="오디오 트랙 선택:")
+        self.audio_track_label.pack(side="left", anchor="w")
+
 
         self.cpu_fr = ttk.LabelFrame(right, text=f"CPU 코어 수 (총 {TOTAL_CORES}개)")
         self.cpu_fr.pack(fill="x", pady=(10,0))
@@ -260,9 +301,32 @@ class VideoToolkitApp(tk.Tk):
                     "-i", str(video_path),
                     "-ss", seconds_to_tc(segment['start']),
                     "-to", seconds_to_tc(segment['end']),
-                    "-map", "0", # Map all streams (video, audio, subtitles, etc.)
                 ]
                 
+                # Video stream mapping
+                cmd.extend(["-map", "0:v"])
+
+                # Handle audio stream mapping based on selection
+                if self.trim_audio.get():
+                    selected_audio_tracks = []
+                    # Iterate through audio_track_vars to get the *actual* 0-based FFmpeg stream indices
+                    for stream_idx, var in self.audio_track_vars.items():
+                        if var.get():
+                            selected_audio_tracks.append(stream_idx) # This is now the 0-based index (0, 1, 2...)
+                    
+                    if selected_audio_tracks:
+                        for track_idx in selected_audio_tracks:
+                            cmd.extend(["-map", f"0:a:{track_idx}"]) # Use the 0-based index directly
+                        cmd.extend(["-c:a", "copy"]) # Copy selected audio tracks
+                    else:
+                        # If "오디오 트랙 유지" is checked but no specific tracks are selected, map all audio tracks
+                        # This happens if all checkboxes are unchecked, but the main "keep audio" is checked.
+                        # '-map 0:a' means map all audio streams.
+                        cmd.extend(["-map", "0:a"]) 
+                        cmd.extend(["-c:a", "copy"]) # Copy all audio tracks
+                else:
+                    cmd.extend(["-an"]) # No audio track
+
                 # Handle video codec
                 if self.use_gpu.get():
                     cmd.extend(["-c:v", "h264_nvenc"]) # Or "hevc_nvenc" for H.265
@@ -270,12 +334,6 @@ class VideoToolkitApp(tk.Tk):
                 else:
                     cmd.extend(["-c:v", "copy"]) # Explicitly copy video stream by default
 
-                # Handle audio codec based on checkbox
-                if self.trim_audio.get(): 
-                    cmd.extend(["-c:a", "copy"]) # Explicitly copy audio stream
-                else:
-                    cmd.extend(["-an"]) # Explicitly remove audio track
-                
                 cmd.append(str(output_path))
                 
                 self.res_text.insert(tk.END, f"명령 실행: {' '.join(cmd)}\n")
@@ -307,18 +365,34 @@ class VideoToolkitApp(tk.Tk):
 
 
     def _lock_ui_for_conversion(self):
-        # Disable all relevant UI elements
-        for widget in (self.trim_fr, self.cpu_fr):
-            for child in widget.winfo_children():
-                child.configure(state='disabled')
+        # Disable all relevant UI elements by targeting specific interactive widgets
+        
+        # Trim options
+        for rb in self.trim_fr.winfo_children():
+            if isinstance(rb, ttk.Radiobutton) or isinstance(rb, ttk.Checkbutton):
+                rb.config(state='disabled')
+        
+        # CPU options
+        for child in self.cpu_fr.winfo_children():
+            if isinstance(child, ttk.Spinbox) or isinstance(child, ttk.Checkbutton):
+                child.config(state='disabled')
+
+        # Audio options
+        # Disable "오디오 트랙 유지" checkbox
+        self.audio_config_fr.winfo_children()[0].config(state='disabled') 
+        # Disable individual audio track checkboxes
+        for cb in self.audio_track_checkboxes:
+            cb.config(state='disabled')
+        
         self.listbox.config(state='disabled')
         self.btn_convert.config(state='disabled')
         self.btn_refresh.config(state='disabled')
         
-        # Disable mode radio buttons by accessing self.mode_frame
+        # Disable mode radio buttons
         if self.mode_frame:
             for rb in self.mode_frame.winfo_children(): 
-                rb.config(state='disabled')
+                if isinstance(rb, ttk.Radiobutton):
+                    rb.config(state='disabled')
         
     def _unlock_ui_after_conversion(self):
         # Enable listbox, convert, and refresh buttons
@@ -442,11 +516,17 @@ class VideoToolkitApp(tk.Tk):
                 pbf_chaps_count = len(parse_pbf(pbf)) if pbf.exists() else '-'
                 ff_chaps_full = ffprobe_get_chapters(path) # Get full list here
                 ff_chaps_count = len(ff_chaps_full)
+                ff_audio_streams = ffprobe_get_audio_streams(path) # Get audio stream indices (0-based)
 
-                # Changed order to PBF | Ch
-                label = f"{path.name} | PBF:{pbf_chaps_count} | Ch:{ff_chaps_count if ff_chaps_count else '-'}"
-                # Store full chapter list for later use in _on_file_select and _on_convert
-                self.files[label] = {"video": path, "pbf": pbf if pbf.exists() else None, "ff_chapters_full": ff_chaps_full} 
+                # Changed order to PBF | Ch | Audio
+                label = f"{path.name} | PBF:{pbf_chaps_count} | Ch:{ff_chaps_count if ff_chaps_count else '-'} | Audio:{len(ff_audio_streams) if ff_audio_streams else '-'}"
+                # Store full chapter list and audio stream list for later use in _on_file_select and _on_convert
+                self.files[label] = {
+                    "video": path, 
+                    "pbf": pbf if pbf.exists() else None, 
+                    "ff_chapters_full": ff_chaps_full,
+                    "ff_audio_streams": ff_audio_streams # Store audio stream indices
+                } 
                 self.listbox.insert(tk.END, label)
 
         # Attempt to re-select the previously selected item
@@ -466,24 +546,42 @@ class VideoToolkitApp(tk.Tk):
     def _update_mode_ui(self):
         is_rename = (self.mode.get() == "rename")
         
-        # Enable/Disable trim options and CPU options based on mode
-        state_trim_cpu = 'disabled' if is_rename else 'normal'
-        for widget in (self.trim_fr, self.cpu_fr):
-            for child in widget.winfo_children():
-                child.configure(state=state_trim_cpu)
+        # Enable/Disable trim options based on mode
+        for rb in self.trim_fr.winfo_children():
+            if isinstance(rb, ttk.Radiobutton) or isinstance(rb, ttk.Checkbutton):
+                rb.config(state='disabled' if is_rename else 'normal')
         
+        # Enable/Disable CPU options based on mode
+        for child in self.cpu_fr.winfo_children():
+            if isinstance(child, ttk.Spinbox) or isinstance(child, ttk.Checkbutton):
+                child.config(state='disabled' if is_rename else 'normal')
+
+        # Enable/Disable audio options based on mode
+        # "오디오 트랙 유지" checkbox
+        self.audio_config_fr.winfo_children()[0].config(state='disabled' if is_rename else 'normal')
+        
+        # Clear and disable audio track checkboxes if in rename mode
+        if is_rename:
+            self._clear_audio_track_checkboxes()
+        else:
+            # If switching back to trim mode, re-evaluate the state of audio track checkboxes
+            self._on_trim_audio_toggle() # This will enable/disable based on self.trim_audio.get()
+
+
         # Mode radio buttons are always enabled except during conversion
         if self.mode_frame:
             # Only disable if conversion_thread is active
             if self.conversion_thread and self.conversion_thread.is_alive(): 
                 for rb in self.mode_frame.winfo_children():
-                    rb.config(state='disabled')
+                    if isinstance(rb, ttk.Radiobutton):
+                        rb.config(state='disabled')
                 self.btn_convert.config(state='disabled') 
                 self.btn_refresh.config(state='disabled') 
                 self.listbox.config(state='disabled') 
             else: # Conversion not active, set all to normal
                 for rb in self.mode_frame.winfo_children():
-                    rb.config(state='normal')
+                    if isinstance(rb, ttk.Radiobutton):
+                        rb.config(state='normal')
                 self.btn_convert.config(state='normal')
                 self.btn_refresh.config(state='normal')
                 self.listbox.config(state='normal')
@@ -497,17 +595,75 @@ class VideoToolkitApp(tk.Tk):
             # Re-call _on_file_select to populate chapter/result text if in trim mode
             self._on_file_select()
 
+    def _on_trim_audio_toggle(self, *args):
+        """Callback for when '오디오 트랙 유지' checkbox is toggled."""
+        if self.trim_audio.get():
+            # If "keep audio" is checked, enable individual audio track checkboxes and the label
+            self.audio_track_label.config(state='normal')
+            for cb in self.audio_track_checkboxes:
+                cb.config(state='normal')
+        else:
+            # If "keep audio" is unchecked, disable individual audio track checkboxes, uncheck them, and disable the label
+            self.audio_track_label.config(state='disabled')
+            for cb in self.audio_track_checkboxes:
+                cb.config(state='disabled')
+                # Uncheck them when disabled
+                if cb._value.get(): # Check if the BooleanVar for this checkbox is true
+                    cb._value.set(False) # Set it to false (uncheck)
+
+
+    def _clear_audio_track_checkboxes(self):
+        """Removes all dynamically created audio track checkboxes and hides the '오디오 트랙 선택:' label."""
+        for cb in self.audio_track_checkboxes:
+            cb.destroy()
+        self.audio_track_checkboxes.clear()
+        self.audio_track_vars.clear()
+        
+        self.audio_track_label.config(state='disabled') # Disable the label when no tracks are displayed
+
+    def _update_audio_track_ui(self, audio_streams: List[int]):
+        """Dynamically creates checkboxes for detected audio streams."""
+        self._clear_audio_track_checkboxes() # Clear existing ones first
+
+        if not audio_streams:
+            # No audio streams found, just show a message within the container (replace label text)
+            self.audio_track_label.config(text="오디오 트랙 없음", state='normal')
+            # Ensure the "오디오 트랙 유지" is also disabled if no audio tracks
+            self.trim_audio.set(False)
+            self.audio_config_fr.winfo_children()[0].config(state='disabled') # This is the "오디오 트랙 유지" checkbox
+            return
+        else:
+            # Ensure the "오디오 트랙 유지" is enabled if audio tracks are found
+            self.audio_config_fr.winfo_children()[0].config(state='normal')
+            
+            # Restore the label text and enable it
+            self.audio_track_label.config(text="오디오 트랙 선택:", state='normal')
+
+        # Create new checkboxes
+        for stream_idx in audio_streams: # audio_streams now contains 0-based indices
+            var = tk.BooleanVar(value=True) # Default to selected
+            self.audio_track_vars[stream_idx] = var
+            # Use stream_idx + 1 for user-friendly display (1-based index)
+            cb = ttk.Checkbutton(self.audio_track_checkbox_container_fr, text=f"{stream_idx + 1}", variable=var)
+            cb.pack(side="left", padx=2)
+            self.audio_track_checkboxes.append(cb)
+            cb._value = var # Store a reference to the BooleanVar in the widget for easy access
+
+        # Set initial state based on self.trim_audio.get()
+        self._on_trim_audio_toggle()
+
 
     def _on_file_select(self, event=None):
         sel = self.listbox.curselection()
         if not sel: 
             self._update_chapter_text([]) # Clear chapter text
             self._update_result_text([]) # Clear result text
+            self._update_audio_track_ui([]) # Clear audio tracks
             return
             
         info = self.files[self.listbox.get(sel[0])]
         
-        # Only update chapter/result text if in trim mode
+        # Only update chapter/result text and audio tracks if in trim mode
         if self.mode.get() == "trim":
             strat = self.trim_strategy.get()
             chapters_raw: List[Dict] = []
@@ -530,9 +686,14 @@ class VideoToolkitApp(tk.Tk):
                 fname = f"{i:02d}_{sanitize_filename(c['title'])}{info['video'].suffix}"
                 results.append({'filename': fname, 'start': seconds_to_tc(start), 'end': seconds_to_tc(end), 'duration': seconds_to_tc(end - start)})
             self._update_result_text(results)
-        else: # If in rename mode, clear the chapter and result texts
+            
+            # Update audio track UI for the selected file
+            self._update_audio_track_ui(info['ff_audio_streams'])
+
+        else: # If in rename mode, clear the chapter and result texts and audio tracks
             self._update_chapter_text([])
             self._update_result_text([])
+            self._update_audio_track_ui([])
 
 
     def _update_chapter_text(self, chapters: List[Dict]):
@@ -550,5 +711,21 @@ class VideoToolkitApp(tk.Tk):
         self.res_text.config(state='disabled')
 
 if __name__ == '__main__':
+    # Check for ffmpeg and ffprobe at startup
+    ffmpeg_found = is_tool_available(FFMPEG_BIN)
+    ffprobe_found = is_tool_available(FFPROBE_BIN)
+
+    if not ffmpeg_found or not ffprobe_found:
+        message = (
+            "FFmpeg이 설치되어 있지 않거나 시스템 PATH에 등록되어 있지 않습니다.\n"
+            "영상 처리 기능을 사용하려면 FFmpeg을 설치해야 합니다.\n\n"
+            "설치 방법:\n"
+            "1. FFmpeg 공식 웹사이트 방문: https://ffmpeg.org/download.html\n"
+            "2. 운영 체제에 맞는 버전을 다운로드하여 설치하거나, 패키지 관리자(예: Windows의 Chocolatey, macOS의 Homebrew, Linux의 apt/dnf)를 사용하여 설치하세요.\n\n"
+            "설치 후 PATH 환경 변수에 FFmpeg 실행 파일 경로를 추가해야 할 수 있습니다."
+        )
+        messagebox.showerror("FFmpeg 필요", message)
+        exit() # Exit the application if FFmpeg is not found
+
     app = VideoToolkitApp()
     app.mainloop()
