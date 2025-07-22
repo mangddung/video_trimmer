@@ -1,0 +1,554 @@
+from __future__ import annotations
+import os, re, json, subprocess, threading, shutil, time
+from pathlib import Path
+from typing import List, Dict
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# -------- 설정 --------
+FFMPEG_BIN = "ffmpeg"
+FFPROBE_BIN = "ffprobe"
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm"}
+PBF_EXT = ".pbf"
+SCRIPT_DIR = Path(__file__).resolve().parent
+# OUTPUT_DIR 설정은 이제 각 영상의 이름을 딴 폴더로 동적으로 결정됩니다.
+TOTAL_CORES = os.cpu_count() or 1
+DEFAULT_CORES = max(1, TOTAL_CORES // 2)
+
+# -------- 유틸 함수 --------
+def run(cmd: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
+
+def ffprobe_get_chapters(video: Path) -> List[Dict]:
+    cmd = [FFPROBE_BIN, "-v", "error", "-print_format", "json", "-show_chapters", str(video)]
+    try:
+        res = run(cmd)
+        data = json.loads(res.stdout or "{}")
+        chaps = []
+        for idx, ch in enumerate(data.get("chapters", []), start=1):
+            start = float(ch.get("start_time", ch.get("start", 0)))
+            title = ch.get("tags", {}).get("title", f"Chapter{idx:02d}")
+            chaps.append({"start": start, "title": title})
+        return sorted(chaps, key=lambda x: x["start"])
+    except:
+        return []
+
+def parse_pbf(pbf_path: Path) -> List[Dict]:
+    markers = []
+    if not pbf_path.exists(): return markers
+    try:
+        content = pbf_path.read_bytes().decode('utf-16-le', errors='ignore')
+    except:
+        return markers
+    pat = re.compile(r"\d+=(\d+)\*([^\*]+)\*")
+    for m in pat.finditer(content):
+        ms, title = m.group(1), m.group(2).strip().replace('/', '_')
+        try:
+            start = int(ms) / 1000.0
+            markers.append({"start": start, "title": title})
+        except:
+            continue
+    return sorted(markers, key=lambda x: x['start'])
+
+def seconds_to_tc(sec: float) -> str:
+    h, m, s = int(sec//3600), int((sec%3600)//60), int(sec%60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r"[\\/:*?<>|]", "_", name)
+
+def get_video_duration(video_path: Path) -> float:
+    cmd = [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)]
+    try:
+        return float(run(cmd).stdout.strip())
+    except:
+        return 0.0
+
+# -------- GUI 애플리케이션 --------
+class VideoToolkitApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("영상 도구 툴킷")
+        self.geometry("1200x680")
+        self.resizable(False, False)
+
+        self.files: Dict[str, Dict] = {}
+        self.mode = tk.StringVar(value="trim")
+        self.trim_strategy = tk.StringVar(value="pbf")
+        self.trim_audio = tk.BooleanVar(value=True)
+        self.between_only = tk.BooleanVar(value=False)
+        self.use_gpu = tk.BooleanVar(value=False)
+        self.cpu_cores = tk.IntVar(value=DEFAULT_CORES)
+        
+        self.timer_id = None
+        self.start_time = 0
+        self.conversion_thread: threading.Thread | None = None
+        self.mode_frame = None # Initialize mode_frame here
+
+        self._build()
+        self.mode.trace_add('write', lambda *args: self._update_mode_ui())
+        self.trim_strategy.trace_add('write', lambda *args: self._on_file_select())
+        self.between_only.trace_add('write', lambda *args: self._on_file_select())
+        self.trim_audio.trace_add('write', lambda *args: self._on_file_select())
+        self._refresh_list()
+
+    def _build(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
+
+        left = ttk.Frame(main)
+        left.pack(side="left", fill="y")
+        ttk.Label(left, text="폴더 내 파일", font=("Segoe UI",12,"bold")).pack()
+        self.listbox = tk.Listbox(left, width=50, height=30)
+        self.listbox.pack(side="left", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", self._on_file_select)
+        sb = ttk.Scrollbar(left, command=self.listbox.yview)
+        sb.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=sb.set)
+
+        right = ttk.Frame(main)
+        right.pack(side="left", fill="both", expand=True, padx=(10,0))
+
+        self.mode_frame = ttk.LabelFrame(right, text="작업 모드") # Assign to self.mode_frame
+        self.mode_frame.pack(fill="x")
+        ttk.Radiobutton(self.mode_frame, text="영상 자르기", variable=self.mode, value="trim").pack(anchor="w")
+        ttk.Radiobutton(self.mode_frame, text="이름 바꾸기", variable=self.mode, value="rename").pack(anchor="w")
+
+        self.trim_fr = ttk.LabelFrame(right, text="자르기 옵션")
+        self.trim_fr.pack(fill="x", pady=(10,0))
+        ttk.Radiobutton(self.trim_fr, text="PBF 기준만", variable=self.trim_strategy, value="pbf").pack(anchor="w")
+        ttk.Radiobutton(self.trim_fr, text="챕터 기준만", variable=self.trim_strategy, value="chapter").pack(anchor="w")
+        ttk.Radiobutton(self.trim_fr, text="교차(PBF+챕터)", variable=self.trim_strategy, value="both").pack(anchor="w")
+        ttk.Checkbutton(self.trim_fr, text="챕터 사이만", variable=self.between_only).pack(anchor="w")
+        ttk.Checkbutton(self.trim_fr, text="오디오 트랙 유지", variable=self.trim_audio).pack(anchor="w")
+
+        self.cpu_fr = ttk.LabelFrame(right, text=f"CPU 코어 수 (총 {TOTAL_CORES}개)")
+        self.cpu_fr.pack(fill="x", pady=(10,0))
+        ttk.Spinbox(self.cpu_fr, from_=1, to=TOTAL_CORES, textvariable=self.cpu_cores, width=5).pack(anchor="w")
+        ttk.Checkbutton(self.cpu_fr, text="GPU 가속 사용", variable=self.use_gpu).pack(anchor="w")
+
+        self.progress = ttk.Progressbar(right, mode="determinate")
+        self.progress.pack(fill="x", pady=(10,0))
+        self.lbl_elapsed = ttk.Label(right, text="경과: 00:00:00")
+        self.lbl_elapsed.pack(anchor="w", pady=(2,10))
+
+        bf = ttk.Frame(right) # Changed to ttk.Frame for consistency
+        bf.pack(fill="x", pady=(5, 15)) # Increased pady for more space below buttons
+
+        self.btn_convert = ttk.Button(bf, text="변환 실행", command=self._on_convert) # Changed to ttk.Button
+        self.btn_convert.pack(side="left", padx=5)
+
+        self.btn_refresh = ttk.Button(bf, text="리스트 새로고침", command=self._refresh_list) # Changed to ttk.Button
+        self.btn_refresh.pack(side="left", padx=5)
+
+        nf = ttk.Notebook(right)
+        nf.pack(fill="both", expand=True)
+        tab1 = ttk.Frame(nf)
+        nf.add(tab1, text="챕터 정보")
+        self.chap_text = tk.Text(tab1, state="disabled", wrap="none")
+        self.chap_text.pack(fill="both", expand=True)
+        tab2 = ttk.Frame(nf)
+        nf.add(tab2, text="최종 결과")
+        self.res_text = tk.Text(tab2, state="disabled", wrap="none")
+        self.res_text.pack(fill="both", expand=True)
+
+        nf.pack(fill="both", expand=True)
+
+    def _on_convert(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showwarning("선택 필요", "먼저 파일을 선택하세요.")
+            return
+        selected_label = self.listbox.get(sel[0])
+        info = self.files[selected_label]
+
+        if self.mode.get() == "rename":
+            self._open_rename_dialog(info)
+        else: # trim mode
+            # Re-evaluate chapters based on current settings for conversion validation
+            strat = self.trim_strategy.get()
+            chapters_raw: List[Dict] = []
+            
+            # Fetch actual chapter data from the file for display/processing
+            full_chapters_from_file = ffprobe_get_chapters(info['video']) 
+            if strat in ("chapter", "both"): chapters_raw.extend(full_chapters_from_file)
+            if strat in ("pbf", "both") and info.get('pbf'): chapters_raw.extend(parse_pbf(info['pbf']))
+            
+            uniq = {c['start']: c['title'] for c in chapters_raw}
+            sorted_chaps = sorted([{'start': s, 'title': t} for s, t in uniq.items()], key=lambda x: x['start'])
+
+            # Determine trimmed chapters for validation
+            trimmed_chaps = sorted_chaps[:-1] if self.between_only.get() and len(sorted_chaps) > 1 else sorted_chaps
+            
+            if not trimmed_chaps:
+                messagebox.showwarning("변환 불가", "선택된 자르기 옵션에 해당하는 챕터/마커를 찾을 수 없습니다. 다른 옵션을 선택하거나 파일을 확인해주세요.")
+                return
+
+            # Start conversion in a new thread
+            self._lock_ui_for_conversion()
+            self._start_timer()
+            
+            self.res_text.config(state='normal')
+            self.res_text.delete('1.0', tk.END)
+            self.res_text.insert(tk.END, f"'{selected_label}' 변환 작업을 시작합니다...\n")
+            self.res_text.config(state='disabled')
+
+            # Reset progress bar
+            self.progress['value'] = 0
+
+            self.conversion_thread = threading.Thread(target=self._start_conversion, args=(info['video'], sorted_chaps))
+            self.conversion_thread.start()
+
+
+    def _start_conversion(self, video_path: Path, sorted_chapters: List[Dict]):
+        try:
+            # Create a subfolder named after the original video file (stem)
+            output_subfolder = SCRIPT_DIR / video_path.stem
+            output_subfolder.mkdir(parents=True, exist_ok=True)
+
+            video_duration = get_video_duration(video_path)
+            
+            self.res_text.config(state='normal')
+            self.res_text.insert(tk.END, f"비디오 길이: {seconds_to_tc(video_duration)}\n")
+            self.res_text.insert(tk.END, "챕터 정보:\n")
+            for i, chapter in enumerate(sorted_chapters):
+                self.res_text.insert(tk.END, f"  {i+1}. {seconds_to_tc(chapter['start'])} - {chapter['title']}\n")
+
+            trimmed_segments = []
+            if self.between_only.get() and len(sorted_chapters) > 1:
+                # If "챕터 사이만" is checked, we cut between existing chapters
+                for i in range(len(sorted_chapters) - 1):
+                    start = sorted_chapters[i]['start']
+                    end = sorted_chapters[i+1]['start']
+                    title = sorted_chapters[i]['title'] # Use the start chapter's title
+                    trimmed_segments.append({'start': start, 'end': end, 'title': title})
+            else:
+                # Cut from each chapter to the next or end of video
+                for i, chapter in enumerate(sorted_chapters):
+                    start = chapter['start']
+                    end = sorted_chapters[i+1]['start'] if i + 1 < len(sorted_chapters) else video_duration
+                    title = chapter['title']
+                    trimmed_segments.append({'start': start, 'end': end, 'title': title})
+
+            if not trimmed_segments:
+                 self.res_text.insert(tk.END, "생성할 비디오 세그먼트가 없습니다.\n")
+                 return
+            
+            # Set progress bar maximum based on number of segments
+            self.progress['maximum'] = len(trimmed_segments)
+
+
+            self.res_text.insert(tk.END, f"\n변환할 세그먼트 (출력 폴더: {output_subfolder.name}):\n")
+            for idx, segment in enumerate(trimmed_segments):
+                # Ensure output filename is unique and safe, following 01_ChapterName.ext format
+                base_filename = sanitize_filename(f"{idx+1:02d}_{segment['title']}")
+                output_filename = f"{base_filename}{video_path.suffix}"
+                output_path = output_subfolder / output_filename # Save inside the new subfolder
+
+                # Handle potential duplicate filenames (e.g., if titles are identical)
+                counter = 1
+                while output_path.exists():
+                    output_filename = f"{base_filename}_{counter}{video_path.suffix}"
+                    output_path = output_subfolder / output_filename
+                    counter += 1
+                
+                self.res_text.insert(tk.END, f"  - {output_path.name} (시작: {seconds_to_tc(segment['start'])}, 끝: {seconds_to_tc(segment['end'])})\n")
+                
+                cmd = [
+                    FFMPEG_BIN,
+                    "-i", str(video_path),
+                    "-ss", seconds_to_tc(segment['start']),
+                    "-to", seconds_to_tc(segment['end']),
+                    "-map", "0", # Map all streams (video, audio, subtitles, etc.)
+                ]
+                
+                # Handle video codec
+                if self.use_gpu.get():
+                    cmd.extend(["-c:v", "h264_nvenc"]) # Or "hevc_nvenc" for H.265
+                    self.res_text.insert(tk.END, "INFO: GPU 가속 (h264_nvenc) 사용.\n")
+                else:
+                    cmd.extend(["-c:v", "copy"]) # Explicitly copy video stream by default
+
+                # Handle audio codec based on checkbox
+                if self.trim_audio.get(): 
+                    cmd.extend(["-c:a", "copy"]) # Explicitly copy audio stream
+                else:
+                    cmd.extend(["-an"]) # Explicitly remove audio track
+                
+                cmd.append(str(output_path))
+                
+                self.res_text.insert(tk.END, f"명령 실행: {' '.join(cmd)}\n")
+                process = run(cmd)
+                self.res_text.insert(tk.END, f"STDOUT:\n{process.stdout}\n")
+                self.res_text.insert(tk.END, f"STDERR:\n{process.stderr}\n")
+                if process.returncode != 0:
+                    self.res_text.insert(tk.END, f"파일 '{output_path.name}' 변환 중 오류 발생!\n")
+                    raise RuntimeError(f"FFmpeg 오류: {process.stderr}")
+                else:
+                    self.res_text.insert(tk.END, f"파일 '{output_path.name}' 변환 완료.\n")
+                
+                # Update progress bar for each completed segment
+                self.progress['value'] = idx + 1
+                self.update_idletasks() # Force UI update
+
+            self.res_text.insert(tk.END, "\n모든 변환 작업이 완료되었습니다.\n")
+            messagebox.showinfo("변환 완료", "모든 영상 변환 작업이 완료되었습니다.") # Conversion completion notification
+        except Exception as e:
+            self.res_text.insert(tk.END, f"\n오류 발생: {e}\n")
+            messagebox.showerror("변환 오류", f"변환 중 오류가 발생했습니다: {e}")
+        finally:
+            self.res_text.config(state='disabled')
+            self._stop_timer()
+            self.progress['value'] = 0 # Reset progress bar
+            self.conversion_thread = None # Ensure the thread is marked as finished
+            # Schedule unlock on main thread to ensure UI updates are safe
+            self.after(100, self._unlock_ui_after_conversion) 
+
+
+    def _lock_ui_for_conversion(self):
+        # Disable all relevant UI elements
+        for widget in (self.trim_fr, self.cpu_fr):
+            for child in widget.winfo_children():
+                child.configure(state='disabled')
+        self.listbox.config(state='disabled')
+        self.btn_convert.config(state='disabled')
+        self.btn_refresh.config(state='disabled')
+        
+        # Disable mode radio buttons by accessing self.mode_frame
+        if self.mode_frame:
+            for rb in self.mode_frame.winfo_children(): 
+                rb.config(state='disabled')
+        
+    def _unlock_ui_after_conversion(self):
+        # Enable listbox, convert, and refresh buttons
+        self.listbox.config(state='normal')
+        self.btn_convert.config(state='normal')
+        self.btn_refresh.config(state='normal')
+        
+        # Restore state of other UI elements based on current mode
+        # This call will now correctly re-enable everything because self.conversion_thread is None
+        self._update_mode_ui() 
+
+    def _start_timer(self):
+        self.start_time = time.time()
+        self._update_timer()
+
+    def _update_timer(self):
+        elapsed = int(time.time() - self.start_time)
+        self.lbl_elapsed.config(text=f"경과: {seconds_to_tc(elapsed)}")
+        self.timer_id = self.after(1000, self._update_timer) # Update every 1 second
+
+    def _stop_timer(self):
+        if self.timer_id:
+            self.after_cancel(self.timer_id)
+            self.timer_id = None
+        self.lbl_elapsed.config(text="경과: 00:00:00") # Reset timer display
+
+    def _open_rename_dialog(self, file_info: Dict):
+        current_video_path: Path = file_info['video']
+        old_name = current_video_path.stem
+        
+        # Create a Toplevel window for renaming
+        rename_dialog = tk.Toplevel(self)
+        rename_dialog.title("파일 이름 바꾸기")
+        rename_dialog.transient(self) # Make it appear on top of the main window
+        rename_dialog.grab_set()     # Make it modal
+        rename_dialog.resizable(False, False)
+
+        # Calculate position to center it on the main window
+        self.update_idletasks()
+        main_x = self.winfo_x()
+        main_y = self.winfo_y()
+        main_width = self.winfo_width()
+        main_height = self.winfo_height()
+
+        dialog_width = 450 # Slightly increased width
+        dialog_height = 130 # Slightly increased height
+        dialog_x = main_x + (main_width // 2) - (dialog_width // 2)
+        dialog_y = main_y + (main_height // 2) - (dialog_height // 2)
+        rename_dialog.geometry(f"{dialog_width}x{dialog_height}+{dialog_x}+{dialog_y}")
+
+
+        frame = ttk.Frame(rename_dialog, padding=15) # Increased padding
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="새 파일명 입력:", font=("Segoe UI", 10)).pack(pady=(0, 8), anchor="w") # Slightly larger font
+        
+        new_name_var = tk.StringVar(value=old_name)
+        name_entry = ttk.Entry(frame, textvariable=new_name_var, width=60, font=("Segoe UI", 10)) # Increased width and font
+        name_entry.pack(fill="x", pady=(0, 15)) # Increased pady below entry
+        name_entry.focus_set()
+
+        def on_ok():
+            new_name = new_name_var.get().strip()
+            if new_name and new_name != old_name:
+                try:
+                    # Rename video file
+                    new_video_path = current_video_path.with_stem(new_name)
+                    os.rename(current_video_path, new_video_path)
+                    
+                    # If PBF exists, rename it too
+                    if file_info['pbf'] and file_info['pbf'].exists():
+                        current_pbf_path: Path = file_info['pbf']
+                        new_pbf_path = current_pbf_path.with_stem(new_name)
+                        os.rename(current_pbf_path, new_pbf_path)
+                        messagebox.showinfo("이름 변경 완료", f"'{old_name}'을(를) '{new_name}'으로(으로) 변경했습니다. PBF 파일도 함께 변경되었습니다.")
+                    else:
+                        messagebox.showinfo("이름 변경 완료", f"'{old_name}'을(를) '{new_name}'으로(으로) 변경했습니다.")
+                    
+                    rename_dialog.destroy()
+                    self._refresh_list() # Refresh the list to show new names
+                    # Re-select the renamed file if possible
+                    for i in range(self.listbox.size()):
+                        label = self.listbox.get(i)
+                        if new_name in label: # Simple check, can be improved
+                            self.listbox.selection_set(i)
+                            self.listbox.activate(i)
+                            self._on_file_select()
+                            break
+
+                except OSError as e:
+                    messagebox.showerror("오류", f"파일 이름을 변경하는 중 오류가 발생했습니다: {e}", parent=rename_dialog)
+            elif new_name == old_name:
+                messagebox.showinfo("알림", "새 파일명이 기존 파일명과 동일합니다. 변경 사항이 없습니다.", parent=rename_dialog)
+                rename_dialog.destroy()
+            else:
+                messagebox.showinfo("알림", "이름 변경이 취소되었습니다.", parent=rename_dialog)
+                rename_dialog.destroy()
+
+        def on_cancel():
+            rename_dialog.destroy()
+
+        # Bind Enter key to on_ok function
+        name_entry.bind("<Return>", lambda event=None: on_ok())
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(fill="x", expand=True)
+        ttk.Button(button_frame, text="확인", command=on_ok).pack(side="left", expand=True, padx=5)
+        ttk.Button(button_frame, text="취소", command=on_cancel).pack(side="right", expand=True, padx=5)
+
+        rename_dialog.wait_window() # Wait until the dialog is closed
+
+    def _refresh_list(self):
+        sel_indices = self.listbox.curselection()
+        selected_label = self.listbox.get(sel_indices[0]) if sel_indices else None
+
+        self.listbox.delete(0, tk.END)
+        self.files.clear()
+        for path in SCRIPT_DIR.iterdir():
+            if path.suffix.lower() in VIDEO_EXTS:
+                pbf = path.with_suffix(PBF_EXT)
+                pbf_chaps_count = len(parse_pbf(pbf)) if pbf.exists() else '-'
+                ff_chaps_full = ffprobe_get_chapters(path) # Get full list here
+                ff_chaps_count = len(ff_chaps_full)
+
+                # Changed order to PBF | Ch
+                label = f"{path.name} | PBF:{pbf_chaps_count} | Ch:{ff_chaps_count if ff_chaps_count else '-'}"
+                # Store full chapter list for later use in _on_file_select and _on_convert
+                self.files[label] = {"video": path, "pbf": pbf if pbf.exists() else None, "ff_chapters_full": ff_chaps_full} 
+                self.listbox.insert(tk.END, label)
+
+        # Attempt to re-select the previously selected item
+        if selected_label:
+            for i in range(self.listbox.size()):
+                if self.listbox.get(i) == selected_label:
+                    self.listbox.selection_set(i)
+                    self.listbox.activate(i) # Ensure it's active for _on_file_select
+                    break
+        else: # If no selection was made before, try to select the first item
+            if self.listbox.size() > 0:
+                self.listbox.selection_set(0)
+                self.listbox.activate(0)
+        self._on_file_select() # Call _on_file_select to update chapter/result text based on current mode
+
+
+    def _update_mode_ui(self):
+        is_rename = (self.mode.get() == "rename")
+        
+        # Enable/Disable trim options and CPU options based on mode
+        state_trim_cpu = 'disabled' if is_rename else 'normal'
+        for widget in (self.trim_fr, self.cpu_fr):
+            for child in widget.winfo_children():
+                child.configure(state=state_trim_cpu)
+        
+        # Mode radio buttons are always enabled except during conversion
+        if self.mode_frame:
+            # Only disable if conversion_thread is active
+            if self.conversion_thread and self.conversion_thread.is_alive(): 
+                for rb in self.mode_frame.winfo_children():
+                    rb.config(state='disabled')
+                self.btn_convert.config(state='disabled') 
+                self.btn_refresh.config(state='disabled') 
+                self.listbox.config(state='disabled') 
+            else: # Conversion not active, set all to normal
+                for rb in self.mode_frame.winfo_children():
+                    rb.config(state='normal')
+                self.btn_convert.config(state='normal')
+                self.btn_refresh.config(state='normal')
+                self.listbox.config(state='normal')
+
+
+        # Clear chapter and result texts if in rename mode
+        if is_rename:
+            self._update_chapter_text([])
+            self._update_result_text([])
+        else:
+            # Re-call _on_file_select to populate chapter/result text if in trim mode
+            self._on_file_select()
+
+
+    def _on_file_select(self, event=None):
+        sel = self.listbox.curselection()
+        if not sel: 
+            self._update_chapter_text([]) # Clear chapter text
+            self._update_result_text([]) # Clear result text
+            return
+            
+        info = self.files[self.listbox.get(sel[0])]
+        
+        # Only update chapter/result text if in trim mode
+        if self.mode.get() == "trim":
+            strat = self.trim_strategy.get()
+            chapters_raw: List[Dict] = []
+            
+            # Use the full chapter list stored during refresh
+            if strat in ("chapter", "both"): chapters_raw.extend(info['ff_chapters_full'])
+            if strat in ("pbf", "both") and info.get('pbf'): chapters_raw.extend(parse_pbf(info['pbf']))
+            
+            uniq = {c['start']: c['title'] for c in chapters_raw}
+            sorted_chaps = sorted([{'start': s, 'title': t} for s, t in uniq.items()], key=lambda x: x['start'])
+            self._update_chapter_text(sorted_chaps)
+
+            duration = get_video_duration(info['video'])
+            results: List[Dict] = []
+            trimmed_chaps = sorted_chaps[:-1] if self.between_only.get() and len(sorted_chaps) > 1 else sorted_chaps
+            for i, c in enumerate(trimmed_chaps, 1):
+                start = c['start']
+                end = sorted_chaps[i]['start'] if i < len(sorted_chaps) else duration
+                # Filename format: 01_ChapterName.ext, saved in a subfolder named after the original video.
+                fname = f"{i:02d}_{sanitize_filename(c['title'])}{info['video'].suffix}"
+                results.append({'filename': fname, 'start': seconds_to_tc(start), 'end': seconds_to_tc(end), 'duration': seconds_to_tc(end - start)})
+            self._update_result_text(results)
+        else: # If in rename mode, clear the chapter and result texts
+            self._update_chapter_text([])
+            self._update_result_text([])
+
+
+    def _update_chapter_text(self, chapters: List[Dict]):
+        self.chap_text.config(state='normal')
+        self.chap_text.delete('1.0', tk.END)
+        for i, c in enumerate(chapters, 1):
+            self.chap_text.insert(tk.END, f"{i:02d}. {seconds_to_tc(c['start'])} - {c['title']}\n")
+        self.chap_text.config(state='disabled')
+
+    def _update_result_text(self, results: List[Dict]):
+        self.res_text.config(state='normal')
+        self.res_text.delete('1.0', tk.END)
+        for r in results:
+            self.res_text.insert(tk.END, f"{r['filename']}: {r['start']} ~ {r['end']} ({r['duration']})\n")
+        self.res_text.config(state='disabled')
+
+if __name__ == '__main__':
+    app = VideoToolkitApp()
+    app.mainloop()
