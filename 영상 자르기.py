@@ -134,7 +134,7 @@ class VideoToolkitApp(tk.Tk):
 
         self.files: Dict[str, Dict] = {}
         self.mode = tk.StringVar(value="trim")
-        self.trim_strategy = tk.StringVar(value="pbf")
+        self.marker_display = tk.StringVar(value="pbf")  # Marker display option
         # self.trim_audio = tk.BooleanVar(value=True) # REMOVED: "오디오 트랙 유지" 옵션 제거
         self.between_only = tk.BooleanVar(value=False)
         self.use_gpu = tk.BooleanVar(value=False)
@@ -148,6 +148,16 @@ class VideoToolkitApp(tk.Tk):
         self.audio_track_checkboxes: List[ttk.Checkbutton] = [] # Store checkbox widgets for easy clearing
         self.audio_track_label = None # To store the "오디오 트랙 선택:" label
         
+        # Segment selection variables
+        self.start_chapter_var = tk.StringVar(value="") # Start chapter selection
+        self.end_chapter_var = tk.StringVar(value="") # End chapter selection
+        self.segment_selection_frame = None # Frame for segment selection
+        self.start_chapter_combo = None # Start chapter combobox
+        self.end_chapter_combo = None # End chapter combobox
+        self.current_chapters = [] # Store current chapter list
+        self.current_selection = None # Store current listbox selection
+        self._updating_segment_ui = False # Flag to prevent UI reset during updates
+        
         # 캐싱을 위한 변수들
         self.file_cache: Dict[Path, Dict] = {}  # 파일별 메타데이터 캐시
         self.scan_progress_var = tk.StringVar(value="준비됨")
@@ -155,8 +165,8 @@ class VideoToolkitApp(tk.Tk):
 
         self._build()
         self.mode.trace_add('write', lambda *args: self._update_mode_ui())
-        self.trim_strategy.trace_add('write', lambda *args: self._on_file_select()) # Added trace for trim_strategy
         self.between_only.trace_add('write', lambda *args: self._on_file_select())
+        self.marker_display.trace_add('write', lambda *args: self._on_marker_display_change())
         # self.trim_audio.trace_add('write', self._on_trim_audio_toggle) # REMOVED: "오디오 트랙 유지" 옵션 제거
         self._refresh_list()
 
@@ -175,6 +185,7 @@ class VideoToolkitApp(tk.Tk):
         self.listbox = tk.Listbox(list_frame, width=80, height=30, font=("Consolas", 10)) # Increased width, set font
         self.listbox.pack(side="left", fill="y", expand=True)
         self.listbox.bind("<<ListboxSelect>>", self._on_file_select)
+        self.listbox.bind("<Button-1>", self._on_listbox_click)  # Add click handler
         sb = ttk.Scrollbar(list_frame, command=self.listbox.yview)
         sb.pack(side="right", fill="y")
         self.listbox.config(yscrollcommand=sb.set)
@@ -187,12 +198,20 @@ class VideoToolkitApp(tk.Tk):
         ttk.Radiobutton(self.mode_frame, text="영상 자르기", variable=self.mode, value="trim").pack(anchor="w")
         ttk.Radiobutton(self.mode_frame, text="이름 바꾸기", variable=self.mode, value="rename").pack(anchor="w")
 
-        self.trim_fr = ttk.LabelFrame(right, text="자르기 옵션")
-        self.trim_fr.pack(fill="x", pady=(10,0))
-        ttk.Radiobutton(self.trim_fr, text="PBF 기준만", variable=self.trim_strategy, value="pbf").pack(anchor="w")
-        ttk.Radiobutton(self.trim_fr, text="챕터 기준만", variable=self.trim_strategy, value="chapter").pack(anchor="w")
-        ttk.Radiobutton(self.trim_fr, text="교차(PBF+챕터)", variable=self.trim_strategy, value="both").pack(anchor="w")
-        ttk.Checkbutton(self.trim_fr, text="챕터 사이만", variable=self.between_only).pack(anchor="w")
+        # Marker display options
+        self.marker_fr = ttk.LabelFrame(right, text="마커 표시 옵션")
+        self.marker_fr.pack(fill="x", pady=(10,0))
+        ttk.Radiobutton(self.marker_fr, text="PBF 마커만", variable=self.marker_display, value="pbf", 
+                       command=self._on_marker_display_change).pack(anchor="w")
+        ttk.Radiobutton(self.marker_fr, text="챕터 마커만", variable=self.marker_display, value="chapter", 
+                       command=self._on_marker_display_change).pack(anchor="w")
+        ttk.Radiobutton(self.marker_fr, text="둘 다 표시", variable=self.marker_display, value="both", 
+                       command=self._on_marker_display_change).pack(anchor="w")
+        
+        # Additional options
+        self.options_fr = ttk.LabelFrame(right, text="추가 옵션")
+        self.options_fr.pack(fill="x", pady=(10,0))
+        ttk.Checkbutton(self.options_fr, text="챕터 사이만", variable=self.between_only).pack(anchor="w")
         
         # Audio options frame - now a separate LabelFrame
         self.audio_config_fr = ttk.LabelFrame(right, text="오디오 옵션")
@@ -233,8 +252,48 @@ class VideoToolkitApp(tk.Tk):
         nf.pack(fill="both", expand=True)
         tab1 = ttk.Frame(nf)
         nf.add(tab1, text="챕터 정보")
-        self.chap_text = tk.Text(tab1, state="disabled", wrap="none")
-        self.chap_text.pack(fill="both", expand=True)
+        
+        # Segment selection frame
+        self.segment_selection_frame = ttk.LabelFrame(tab1, text="구간 선택")
+        self.segment_selection_frame.pack(fill="x", padx=5, pady=5)
+        
+        # Start chapter selection
+        start_frame = ttk.Frame(self.segment_selection_frame)
+        start_frame.pack(fill="x", padx=5, pady=2)
+        ttk.Label(start_frame, text="시작 챕터:").pack(side="left")
+        self.start_chapter_combo = ttk.Combobox(start_frame, textvariable=self.start_chapter_var, 
+                                               state="readonly", width=50)
+        self.start_chapter_combo.pack(side="left", padx=(10, 0), fill="x", expand=True)
+        self.start_chapter_combo.bind("<<ComboboxSelected>>", self._on_segment_selection_change)
+        self.start_chapter_combo.bind("<FocusIn>", self._on_combobox_focus)
+        self.start_chapter_combo.bind("<FocusOut>", self._on_combobox_focus_out)
+        
+        # End chapter selection
+        end_frame = ttk.Frame(self.segment_selection_frame)
+        end_frame.pack(fill="x", padx=5, pady=2)
+        ttk.Label(end_frame, text="끝 챕터:").pack(side="left")
+        self.end_chapter_combo = ttk.Combobox(end_frame, textvariable=self.end_chapter_var, 
+                                             state="readonly", width=50)
+        self.end_chapter_combo.pack(side="left", padx=(10, 0), fill="x", expand=True)
+        self.end_chapter_combo.bind("<<ComboboxSelected>>", self._on_segment_selection_change)
+        self.end_chapter_combo.bind("<FocusIn>", self._on_combobox_focus)
+        self.end_chapter_combo.bind("<FocusOut>", self._on_combobox_focus_out)
+        
+        # Segment info
+        self.segment_info_label = ttk.Label(self.segment_selection_frame, text="구간을 선택하세요", 
+                                           font=("Segoe UI", 9), foreground="gray")
+        self.segment_info_label.pack(padx=5, pady=5)
+        
+        # Chapter info text (scrollable)
+        text_frame = ttk.Frame(tab1)
+        text_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.chap_text = tk.Text(text_frame, state="disabled", wrap="none", height=8)
+        scrollbar_chap = ttk.Scrollbar(text_frame, command=self.chap_text.yview)
+        self.chap_text.config(yscrollcommand=scrollbar_chap.set)
+        self.chap_text.pack(side="left", fill="both", expand=True)
+        scrollbar_chap.pack(side="right", fill="y")
+        
         tab2 = ttk.Frame(nf)
         nf.add(tab2, text="최종 결과")
         self.res_text = tk.Text(tab2, state="disabled", wrap="none")
@@ -264,23 +323,37 @@ class VideoToolkitApp(tk.Tk):
                 messagebox.showwarning("오디오 트랙 선택 필요", "하나 이상의 오디오 트랙을 선택해야 합니다.")
                 return
 
-            # Re-evaluate chapters based on current settings for conversion validation
-            strat = self.trim_strategy.get()
+            # Get selected segment for conversion
+            start_idx = self.start_chapter_combo.current()
+            end_idx = self.end_chapter_combo.current()
+            
+            if start_idx == -1 or end_idx == -1:
+                messagebox.showwarning("변환 불가", "시작 챕터와 끝 챕터를 모두 선택해주세요.")
+                return
+                
+            if start_idx >= end_idx:
+                messagebox.showwarning("변환 불가", "끝 챕터는 시작 챕터보다 뒤에 있어야 합니다.")
+                return
+                
+            # Re-evaluate chapters based on marker display option for conversion validation
+            marker_type = self.marker_display.get()
             chapters_raw: List[Dict] = []
             
             # Fetch actual chapter data from the file for display/processing
-            full_chapters_from_file = ffprobe_get_chapters(info['video']) 
-            if strat in ("chapter", "both"): chapters_raw.extend(full_chapters_from_file)
-            if strat in ("pbf", "both") and info.get('pbf'): chapters_raw.extend(parse_pbf(info['pbf']))
+            if marker_type in ("pbf", "both") and info.get('pbf'):
+                chapters_raw.extend(parse_pbf(info['pbf']))
+            if marker_type in ("chapter", "both"):
+                chapters_raw.extend(ffprobe_get_chapters(info['video']))
             
             uniq = {c['start']: c['title'] for c in chapters_raw}
             sorted_chaps = sorted([{'start': s, 'title': t} for s, t in uniq.items()], key=lambda x: x['start'])
 
-            # Determine trimmed chapters for validation
-            trimmed_chaps = sorted_chaps[:-1] if self.between_only.get() and len(sorted_chaps) > 1 else sorted_chaps
+            # Get selected segment
+            start_chapter = sorted_chaps[start_idx]
+            end_chapter = sorted_chaps[end_idx]
             
-            if not trimmed_chaps:
-                messagebox.showwarning("변환 불가", "선택된 자르기 옵션에 해당하는 챕터/마커를 찾을 수 없습니다. 다른 옵션을 선택하거나 파일을 확인해주세요.")
+            if not start_chapter or not end_chapter:
+                messagebox.showwarning("변환 불가", "선택된 챕터가 유효하지 않습니다.")
                 return
 
             # Start conversion in a new thread
@@ -289,17 +362,18 @@ class VideoToolkitApp(tk.Tk):
             
             self.res_text.config(state='normal')
             self.res_text.delete('1.0', tk.END)
-            self.res_text.insert(tk.END, f"'{selected_label}' 변환 작업을 시작합니다...\n")
+            self.res_text.insert(tk.END, f"'{selected_label}' 구간 변환 작업을 시작합니다...\n")
             self.res_text.config(state='disabled')
 
             # Reset progress bar
             self.progress['value'] = 0
 
-            self.conversion_thread = threading.Thread(target=self._start_conversion, args=(info['video'], sorted_chaps))
+            self.conversion_thread = threading.Thread(target=self._start_segment_conversion, 
+                                                    args=(info['video'], start_chapter, end_chapter))
             self.conversion_thread.start()
 
-
-    def _start_conversion(self, video_path: Path, sorted_chapters: List[Dict]):
+    def _start_segment_conversion(self, video_path: Path, start_chapter: Dict, end_chapter: Dict):
+        """Convert a single segment between two chapters."""
         try:
             # Create a subfolder named after the original video file (stem)
             output_subfolder = SCRIPT_DIR / video_path.stem
@@ -309,23 +383,121 @@ class VideoToolkitApp(tk.Tk):
             
             self.res_text.config(state='normal')
             self.res_text.insert(tk.END, f"비디오 길이: {seconds_to_tc(video_duration)}\n")
-            self.res_text.insert(tk.END, "챕터 정보:\n")
-            for i, chapter in enumerate(sorted_chapters):
+            self.res_text.insert(tk.END, f"선택된 구간: {seconds_to_tc(start_chapter['start'])} ~ {seconds_to_tc(end_chapter['start'])}\n")
+            self.res_text.insert(tk.END, f"구간 길이: {seconds_to_tc(end_chapter['start'] - start_chapter['start'])}\n")
+
+            # Create output filename
+            segment_title = f"{start_chapter['title']}_to_{end_chapter['title']}"
+            base_filename = sanitize_filename(segment_title)
+            output_filename = f"01_{base_filename}{video_path.suffix}"
+            output_path = output_subfolder / output_filename
+
+            # Handle potential duplicate filenames
+            counter = 1
+            while output_path.exists():
+                output_filename = f"01_{base_filename}_{counter}{video_path.suffix}"
+                output_path = output_subfolder / output_filename
+                counter += 1
+            
+            self.res_text.insert(tk.END, f"\n변환할 구간 (출력 폴더: {output_subfolder.name}):\n")
+            self.res_text.insert(tk.END, f"  - {output_path.name} (시작: {seconds_to_tc(start_chapter['start'])}, 끝: {seconds_to_tc(end_chapter['start'])})\n")
+            
+            # Set progress bar maximum
+            self.progress['maximum'] = 1
+
+            # Build FFmpeg command
+            cmd = [
+                FFMPEG_BIN,
+                "-ss", seconds_to_tc(start_chapter['start']),
+                "-i", str(video_path),
+                "-to", seconds_to_tc(end_chapter['start'] - start_chapter['start']),
+                "-avoid_negative_ts", "make_zero",
+                "-fflags", "+genpts",
+            ]
+            
+            # Video stream mapping
+            cmd.extend(["-map", "0:v"])
+
+            # Handle audio stream mapping based on selection
+            selected_audio_tracks = [idx for idx, var in self.audio_track_vars.items() if var.get()]
+            if selected_audio_tracks:
+                for track_idx in selected_audio_tracks:
+                    cmd.extend(["-map", f"0:a:{track_idx}"])
+                cmd.extend(["-c:a", "copy"])
+            else:
+                cmd.extend(["-an"])
+
+            # Handle video codec
+            if self.use_gpu.get():
+                cmd.extend(["-c:v", "h264_nvenc"])
+                self.res_text.insert(tk.END, "INFO: GPU 가속 (h264_nvenc) 사용.\n")
+            else:
+                cmd.extend(["-c:v", "copy"])
+
+            cmd.append(str(output_path))
+            
+            self.res_text.insert(tk.END, f"명령 실행: {' '.join(cmd)}\n")
+            process = run(cmd)
+            self.res_text.insert(tk.END, f"STDOUT:\n{process.stdout}\n")
+            self.res_text.insert(tk.END, f"STDERR:\n{process.stderr}\n")
+            
+            if process.returncode != 0:
+                self.res_text.insert(tk.END, f"파일 '{output_path.name}' 변환 중 오류 발생!\n")
+                raise RuntimeError(f"FFmpeg 오류: {process.stderr}")
+            else:
+                self.res_text.insert(tk.END, f"파일 '{output_path.name}' 변환 완료.\n")
+            
+            # Update progress bar
+            self.progress['value'] = 1
+            self.update_idletasks()
+
+            self.res_text.insert(tk.END, "\n구간 변환 작업이 완료되었습니다.\n")
+            messagebox.showinfo("변환 완료", "구간 변환 작업이 완료되었습니다.")
+        except Exception as e:
+            self.res_text.insert(tk.END, f"\n오류 발생: {e}\n")
+            messagebox.showerror("변환 오류", f"변환 중 오류가 발생했습니다: {e}")
+        finally:
+            self.res_text.config(state='disabled')
+            self._stop_timer()
+            self.progress['value'] = 0
+            self.conversion_thread = None
+            self.after(100, self._unlock_ui_after_conversion)
+
+    def _start_conversion(self, video_path: Path, selected_chapters: List[Dict], all_chapters: List[Dict]):
+        try:
+            # Create a subfolder named after the original video file (stem)
+            output_subfolder = SCRIPT_DIR / video_path.stem
+            output_subfolder.mkdir(parents=True, exist_ok=True)
+
+            video_duration = get_video_duration(video_path)
+            
+            self.res_text.config(state='normal')
+            self.res_text.insert(tk.END, f"비디오 길이: {seconds_to_tc(video_duration)}\n")
+            self.res_text.insert(tk.END, f"선택된 챕터 ({len(selected_chapters)}개):\n")
+            for i, chapter in enumerate(selected_chapters):
                 self.res_text.insert(tk.END, f"  {i+1}. {seconds_to_tc(chapter['start'])} - {chapter['title']}\n")
 
             trimmed_segments = []
-            if self.between_only.get() and len(sorted_chapters) > 1:
-                # If "챕터 사이만" is checked, we cut between existing chapters
-                for i in range(len(sorted_chapters) - 1):
-                    start = sorted_chapters[i]['start']
-                    end = sorted_chapters[i+1]['start']
-                    title = sorted_chapters[i]['title'] # Use the start chapter's title
+            if self.between_only.get() and len(selected_chapters) > 1:
+                # If "챕터 사이만" is checked, we cut between selected chapters
+                for i in range(len(selected_chapters) - 1):
+                    start = selected_chapters[i]['start']
+                    end = selected_chapters[i+1]['start']
+                    title = selected_chapters[i]['title'] # Use the start chapter's title
                     trimmed_segments.append({'start': start, 'end': end, 'title': title})
             else:
-                # Cut from each chapter to the next or end of video
-                for i, chapter in enumerate(sorted_chapters):
+                # Cut from each selected chapter to the next chapter or end of video
+                for i, chapter in enumerate(selected_chapters):
                     start = chapter['start']
-                    end = sorted_chapters[i+1]['start'] if i + 1 < len(sorted_chapters) else video_duration
+                    
+                    # Find the next chapter in the full chapter list
+                    next_chapter_start = video_duration
+                    for j, full_chapter in enumerate(all_chapters):
+                        if full_chapter['start'] > start:
+                            next_chapter_start = full_chapter['start']
+                            break
+                    
+                    end = next_chapter_start
                     title = chapter['title']
                     trimmed_segments.append({'start': start, 'end': end, 'title': title})
 
@@ -414,9 +586,9 @@ class VideoToolkitApp(tk.Tk):
     def _lock_ui_for_conversion(self):
         # Disable all relevant UI elements by targeting specific interactive widgets
         
-        # Trim options
-        for rb in self.trim_fr.winfo_children():
-            if isinstance(rb, (ttk.Radiobutton, ttk.Checkbutton)): # Use tuple for multiple types
+        # Additional options
+        for rb in self.options_fr.winfo_children():
+            if isinstance(rb, ttk.Checkbutton):
                 rb.config(state='disabled')
         
         # CPU options
@@ -429,6 +601,10 @@ class VideoToolkitApp(tk.Tk):
         for cb in self.audio_track_checkboxes:
             cb.config(state='disabled')
         self.audio_track_label.config(state='disabled') # Disable the audio track label
+
+        # Segment selection options
+        self.start_chapter_combo.config(state='disabled')
+        self.end_chapter_combo.config(state='disabled')
 
         self.listbox.config(state='disabled')
         self.btn_convert.config(state='disabled')
@@ -683,9 +859,14 @@ class VideoToolkitApp(tk.Tk):
     def _update_mode_ui(self):
         is_rename = (self.mode.get() == "rename")
         
-        # Enable/Disable trim options based on mode
-        for rb in self.trim_fr.winfo_children():
-            if isinstance(rb, (ttk.Radiobutton, ttk.Checkbutton)): 
+        # Enable/Disable marker display options based on mode
+        for rb in self.marker_fr.winfo_children():
+            if isinstance(rb, ttk.Radiobutton): 
+                rb.config(state='disabled' if is_rename else 'normal')
+        
+        # Enable/Disable additional options based on mode
+        for rb in self.options_fr.winfo_children():
+            if isinstance(rb, ttk.Checkbutton): 
                 rb.config(state='disabled' if is_rename else 'normal')
         
         # Enable/Disable CPU options based on mode
@@ -713,6 +894,24 @@ class VideoToolkitApp(tk.Tk):
                 self.audio_track_label.config(state='disabled')
                 for cb in self.audio_track_checkboxes:
                     cb.config(state='disabled')
+
+        # Segment selection options
+        if is_rename:
+            self.start_chapter_combo.config(state='disabled')
+            self.end_chapter_combo.config(state='disabled')
+            self.start_chapter_var.set("")
+            self.end_chapter_var.set("")
+        else:
+            # Re-enable segment selection if in trim mode and file is selected
+            sel = self.listbox.curselection()
+            if sel and sel[0] != 0:
+                self.start_chapter_combo.config(state='readonly')
+                self.end_chapter_combo.config(state='readonly')
+                # Ensure listbox selection is maintained
+                self.after_idle(lambda: self.listbox.selection_set(sel[0]) if sel else None)
+            else:
+                self.start_chapter_combo.config(state='disabled')
+                self.end_chapter_combo.config(state='disabled')
 
 
         # Mode radio buttons are always enabled except during conversion
@@ -764,7 +963,169 @@ class VideoToolkitApp(tk.Tk):
         self.audio_track_vars.clear()
         
         # Hide the label and set text back to original for next display
-        self.audio_track_label.config(text="오디오 트랙 선택:", state='disabled') 
+        self.audio_track_label.config(text="오디오 트랙 선택:", state='disabled')
+
+    def _update_segment_display(self, info: Dict):
+        """Update segment display based on marker display option."""
+        if self.mode.get() != "trim":
+            return
+            
+        # Get chapters based on marker display option
+        marker_type = self.marker_display.get()
+        chapters_raw: List[Dict] = []
+        
+        if marker_type in ("pbf", "both") and info.get('pbf'):
+            chapters_raw.extend(parse_pbf(info['pbf']))
+        if marker_type in ("chapter", "both"):
+            chapters_raw.extend(info['ff_chapters_full'])
+            
+        uniq = {c['start']: c['title'] for c in chapters_raw}
+        sorted_chaps = sorted([{'start': s, 'title': t} for s, t in uniq.items()], key=lambda x: x['start'])
+        
+        # Update segment selection UI
+        self._update_segment_selection_ui(sorted_chaps)
+        
+        # Update result text
+        self._update_result_text_from_segment()
+
+    def _update_segment_selection_ui(self, chapters: List[Dict]):
+        """Updates the segment selection comboboxes with chapter data."""
+        self.current_chapters = chapters
+        
+        if not chapters:
+            self.start_chapter_combo['values'] = []
+            self.end_chapter_combo['values'] = []
+            self.start_chapter_var.set("")
+            self.end_chapter_var.set("")
+            self.segment_info_label.config(text="챕터가 없습니다", foreground="red")
+            return
+            
+        # Create chapter options for comboboxes
+        chapter_options = []
+        for i, chapter in enumerate(chapters):
+            time_str = seconds_to_tc(chapter['start'])
+            title = chapter['title']
+            # Add marker type prefix
+            marker_type = self.marker_display.get()
+            if marker_type == "pbf":
+                prefix = "[PBF]"
+            elif marker_type == "chapter":
+                prefix = "[CH]"
+            else:  # both
+                prefix = "[PBF]" if any(c['start'] == chapter['start'] for c in parse_pbf(self.files[self.listbox.get(self.listbox.curselection()[0])]['pbf']) if self.files[self.listbox.get(self.listbox.curselection()[0])].get('pbf')) else "[CH]"
+            
+            option_text = f"{i+1:02d}. {time_str} - {prefix} {title}"
+            chapter_options.append(option_text)
+        
+        # Update comboboxes
+        self.start_chapter_combo['values'] = chapter_options
+        self.end_chapter_combo['values'] = chapter_options
+        
+        # Only reset selections if this is a new file (not when updating existing selection)
+        if not hasattr(self, '_updating_segment_ui') or not self._updating_segment_ui:
+            self.start_chapter_var.set("")
+            self.end_chapter_var.set("")
+            self.segment_info_label.config(text="구간을 선택하세요", foreground="gray")
+
+    def _on_marker_display_change(self, *args):
+        """Called when marker display option changes."""
+        # Update the segment selection UI with filtered chapters
+        sel = self.listbox.curselection()
+        if sel and sel[0] != 0:
+            info = self.files[self.listbox.get(sel[0])]
+            self._update_segment_display(info)
+
+    def _on_segment_selection_change(self, event=None):
+        """Called when segment selection changes."""
+        # Store current selection before any UI updates
+        current_sel = self.listbox.curselection()
+        if current_sel and current_sel[0] != 0:
+            self.current_selection = current_sel[0]
+        
+        # Prevent _on_file_select from being called during segment selection
+        self._updating_segment_ui = True
+        
+        self._update_segment_info()
+        self._update_result_text_from_segment()
+        
+        # Force restore selection multiple times to ensure it sticks
+        if hasattr(self, 'current_selection') and self.current_selection is not None:
+            self.after(10, lambda: self.listbox.selection_set(self.current_selection))
+            self.after(50, lambda: self.listbox.selection_set(self.current_selection))
+            self.after(100, lambda: self.listbox.selection_set(self.current_selection))
+        
+        # Reset the flag after a delay
+        self.after(200, lambda: setattr(self, '_updating_segment_ui', False))
+
+    def _update_segment_info(self):
+        """Updates the segment info label based on current selection."""
+        start_idx = self.start_chapter_combo.current()
+        end_idx = self.end_chapter_combo.current()
+        
+        if start_idx == -1 and end_idx == -1:
+            self.segment_info_label.config(text="구간을 선택하세요", foreground="gray")
+        elif start_idx == -1:
+            self.segment_info_label.config(text="시작 챕터를 선택하세요", foreground="orange")
+        elif end_idx == -1:
+            self.segment_info_label.config(text="끝 챕터를 선택하세요", foreground="orange")
+        elif start_idx >= end_idx:
+            self.segment_info_label.config(text="끝 챕터는 시작 챕터보다 뒤에 있어야 합니다", foreground="red")
+        else:
+            # Valid selection
+            start_chapter = self.current_chapters[start_idx]
+            end_chapter = self.current_chapters[end_idx]
+            duration = end_chapter['start'] - start_chapter['start']
+            self.segment_info_label.config(
+                text=f"선택된 구간: {seconds_to_tc(start_chapter['start'])} ~ {seconds_to_tc(end_chapter['start'])} (길이: {seconds_to_tc(duration)})", 
+                foreground="green"
+            )
+
+    def _update_result_text_from_segment(self):
+        """Update result text based on selected segment."""
+        sel = self.listbox.curselection()
+        if not sel or sel[0] == 0:
+            self._update_result_text([])
+            return
+            
+        info = self.files[self.listbox.get(sel[0])]
+        
+        if self.mode.get() != "trim":
+            self._update_result_text([])
+            return
+            
+        start_idx = self.start_chapter_combo.current()
+        end_idx = self.end_chapter_combo.current()
+        
+        if start_idx == -1 or end_idx == -1 or start_idx >= end_idx:
+            self._update_result_text([])
+            return
+            
+        # Get video duration
+        video_path = info['video']
+        if video_path in self.file_cache and 'duration' in self.file_cache[video_path]:
+            duration = self.file_cache[video_path]['duration']
+        else:
+            duration = get_video_duration(video_path)
+            
+        # Create result for selected segment
+        start_chapter = self.current_chapters[start_idx]
+        end_chapter = self.current_chapters[end_idx]
+        
+        start_time = start_chapter['start']
+        end_time = end_chapter['start']
+        
+        # Create filename based on segment
+        segment_title = f"{start_chapter['title']}_to_{end_chapter['title']}"
+        fname = f"01_{sanitize_filename(segment_title)}{info['video'].suffix}"
+        
+        results = [{
+            'filename': fname,
+            'start': seconds_to_tc(start_time),
+            'end': seconds_to_tc(end_time),
+            'duration': seconds_to_tc(end_time - start_time)
+        }]
+        
+        self._update_result_text(results) 
 
     def _update_audio_track_ui(self, audio_streams: List[int]):
         """Dynamically creates checkboxes for detected audio streams."""
@@ -783,7 +1144,8 @@ class VideoToolkitApp(tk.Tk):
             var = tk.BooleanVar(value=True) # Default to selected
             self.audio_track_vars[stream_idx] = var
             # Use stream_idx + 1 for user-friendly display (1-based index)
-            cb = ttk.Checkbutton(self.audio_track_checkbox_container_fr, text=f"{stream_idx + 1}", variable=var)
+            cb = ttk.Checkbutton(self.audio_track_checkbox_container_fr, text=f"{stream_idx + 1}", variable=var,
+                               command=self._maintain_listbox_selection)  # Add command to maintain selection
             cb.pack(side="left", padx=2)
             self.audio_track_checkboxes.append(cb)
             cb._value = var # Store a reference to the BooleanVar in the widget for easy access
@@ -793,47 +1155,69 @@ class VideoToolkitApp(tk.Tk):
             cb.config(state='normal')
 
 
+    def _on_listbox_click(self, event):
+        """Handle listbox click to prevent deselection when clicking other UI elements."""
+        # Allow normal selection behavior
+        pass
+
+    def _on_combobox_focus(self, event):
+        """Handle combobox focus in - store current listbox selection."""
+        sel = self.listbox.curselection()
+        if sel and sel[0] != 0:
+            self.current_selection = sel[0]
+        # Set flag to prevent UI clearing during combobox interaction
+        self._updating_segment_ui = True
+
+    def _on_combobox_focus_out(self, event):
+        """Handle combobox focus out - restore listbox selection."""
+        if hasattr(self, 'current_selection') and self.current_selection is not None:
+            self.after(10, lambda: self.listbox.selection_set(self.current_selection))
+        # Reset flag after a delay
+        self.after(100, lambda: setattr(self, '_updating_segment_ui', False))
+
+    def _maintain_listbox_selection(self):
+        """Maintain listbox selection when other UI elements are interacted with."""
+        sel = self.listbox.curselection()
+        if sel and sel[0] != 0:
+            # Store the current selection
+            self.current_selection = sel[0]
+            # Re-select after a short delay to ensure it's maintained
+            self.after(10, lambda: self.listbox.selection_set(self.current_selection))
+
     def _on_file_select(self, event=None):
+        # Skip if we're updating segment UI to prevent clearing selections
+        if hasattr(self, '_updating_segment_ui') and self._updating_segment_ui:
+            return
+            
         sel = self.listbox.curselection()
         # If the header row (index 0) is selected, or nothing is selected, clear display and return
         if not sel or sel[0] == 0: 
             self._update_chapter_text([]) 
             self._update_result_text([])
-            self._update_audio_track_ui([]) 
+            self._update_audio_track_ui([])
+            self._update_segment_selection_ui([])
             return
             
         info = self.files[self.listbox.get(sel[0])]
         
         # Only update chapter/result text and audio tracks if in trim mode
         if self.mode.get() == "trim":
-            strat = self.trim_strategy.get()
+            # Update segment display based on marker display option
+            self._update_segment_display(info)
+            
+            # Update chapter text with all chapters for reference
             chapters_raw: List[Dict] = []
             
             # Use the full chapter list stored during refresh (cached data)
-            if strat in ("chapter", "both"): chapters_raw.extend(info['ff_chapters_full'])
-            if strat in ("pbf", "both") and info.get('pbf'): chapters_raw.extend(parse_pbf(info['pbf']))
+            chapters_raw.extend(info['ff_chapters_full'])
+            if info.get('pbf'):
+                chapters_raw.extend(parse_pbf(info['pbf']))
             
             uniq = {c['start']: c['title'] for c in chapters_raw}
             sorted_chaps = sorted([{'start': s, 'title': t} for s, t in uniq.items()], key=lambda x: x['start'])
+            
+            # Update chapter text
             self._update_chapter_text(sorted_chaps)
-
-            # 비디오 길이는 캐시에서 가져옴 (이미 analyze_single_video에서 계산됨)
-            video_path = info['video']
-            if video_path in self.file_cache and 'duration' in self.file_cache[video_path]:
-                duration = self.file_cache[video_path]['duration']
-            else:
-                # 캐시에 없는 경우에만 계산 (거의 발생하지 않음)
-                duration = get_video_duration(video_path)
-                    
-            results: List[Dict] = []
-            trimmed_chaps = sorted_chaps[:-1] if self.between_only.get() and len(sorted_chaps) > 1 else sorted_chaps
-            for i, c in enumerate(trimmed_chaps, 1):
-                start = c['start']
-                end = sorted_chaps[i]['start'] if i < len(sorted_chaps) else duration
-                # Filename format: 01_ChapterName.ext, saved in a subfolder named after the original video.
-                fname = f"{i:02d}_{sanitize_filename(c['title'])}{info['video'].suffix}"
-                results.append({'filename': fname, 'start': seconds_to_tc(start), 'end': seconds_to_tc(end), 'duration': seconds_to_tc(end - start)})
-            self._update_result_text(results)
             
             # Update audio track UI for the selected file
             self._update_audio_track_ui(info['ff_audio_streams'])
@@ -842,6 +1226,7 @@ class VideoToolkitApp(tk.Tk):
             self._update_chapter_text([])
             self._update_result_text([])
             self._update_audio_track_ui([])
+            self._update_segment_selection_ui([])
 
 
     def _update_chapter_text(self, chapters: List[Dict]):
