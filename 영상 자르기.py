@@ -87,6 +87,43 @@ def get_video_duration(video_path: Path) -> float:
     except:
         return 0.0
 
+def analyze_single_video(video_path: Path) -> Dict[str, Any]:
+    """단일 비디오 파일의 메타데이터를 분석하여 반환"""
+    try:
+        pbf = video_path.with_suffix(PBF_EXT)
+        pbf_chaps_count = len(parse_pbf(pbf)) if pbf.exists() else 0
+        ff_chaps_full = ffprobe_get_chapters(video_path)
+        ff_chaps_count = len(ff_chaps_full)
+        ff_audio_streams = ffprobe_get_audio_streams(video_path)
+        audio_count = len(ff_audio_streams)
+        duration = get_video_duration(video_path)
+        
+        return {
+            "video": video_path,
+            "pbf": pbf if pbf.exists() else None,
+            "pbf_chaps_count": pbf_chaps_count,
+            "ff_chapters_full": ff_chaps_full,
+            "ff_chaps_count": ff_chaps_count,
+            "ff_audio_streams": ff_audio_streams,
+            "audio_count": audio_count,
+            "duration": duration,
+            "analyzed": True
+        }
+    except Exception as e:
+        print(f"Error analyzing {video_path}: {e}")
+        return {
+            "video": video_path,
+            "pbf": None,
+            "pbf_chaps_count": 0,
+            "ff_chapters_full": [],
+            "ff_chaps_count": 0,
+            "ff_audio_streams": [],
+            "audio_count": 0,
+            "duration": 0.0,
+            "analyzed": False,
+            "error": str(e)
+        }
+
 # -------- GUI 애플리케이션 --------
 class VideoToolkitApp(tk.Tk):
     def __init__(self):
@@ -110,6 +147,11 @@ class VideoToolkitApp(tk.Tk):
         self.audio_track_vars: Dict[int, tk.BooleanVar] = {} # Store BooleanVars for audio tracks
         self.audio_track_checkboxes: List[ttk.Checkbutton] = [] # Store checkbox widgets for easy clearing
         self.audio_track_label = None # To store the "오디오 트랙 선택:" label
+        
+        # 캐싱을 위한 변수들
+        self.file_cache: Dict[Path, Dict] = {}  # 파일별 메타데이터 캐시
+        self.scan_progress_var = tk.StringVar(value="준비됨")
+        self.scan_thread: threading.Thread | None = None
 
         self._build()
         self.mode.trace_add('write', lambda *args: self._update_mode_ui())
@@ -174,7 +216,9 @@ class VideoToolkitApp(tk.Tk):
         self.progress = ttk.Progressbar(right, mode="determinate")
         self.progress.pack(fill="x", pady=(10,0))
         self.lbl_elapsed = ttk.Label(right, text="경과: 00:00:00")
-        self.lbl_elapsed.pack(anchor="w", pady=(2,10))
+        self.lbl_elapsed.pack(anchor="w", pady=(2,5))
+        self.lbl_scan_progress = ttk.Label(right, textvariable=self.scan_progress_var, font=("Segoe UI", 9))
+        self.lbl_scan_progress.pack(anchor="w", pady=(0,10))
 
         bf = ttk.Frame(right) # Changed to ttk.Frame for consistency
         bf.pack(fill="x", pady=(5, 15)) # Increased pady for more space below buttons
@@ -501,59 +545,137 @@ class VideoToolkitApp(tk.Tk):
         rename_dialog.wait_window() # Wait until the dialog is closed
 
     def _refresh_list(self):
+        """파일 목록을 새로고침합니다. 병렬 처리를 사용하여 성능을 최적화합니다."""
+        # 이미 스캔 중이면 중단
+        if self.scan_thread and self.scan_thread.is_alive():
+            return
+            
         sel_indices = self.listbox.curselection()
         selected_label = None
-        if sel_indices and sel_indices[0] != 0: # Check if a data row was selected
+        if sel_indices and sel_indices[0] != 0:
             selected_label = self.listbox.get(sel_indices[0])
 
+        # UI 초기화
         self.listbox.delete(0, tk.END)
         self.files.clear()
         
-        # Add header row to the listbox
+        # 헤더 추가
         header_text = f"{'파일명':<35s} | {'PBF':<5s} | {'Ch':<5s} | {'Audio':<5s}"
         self.listbox.insert(tk.END, header_text)
-        self.listbox.itemconfig(0, {'bg': 'lightgray', 'fg': 'black'}) # Style the header
+        self.listbox.itemconfig(0, {'bg': 'lightgray', 'fg': 'black'})
+        
+        # 비디오 파일 목록 수집 (이름 순으로 정렬)
+        video_files = sorted([path for path in SCRIPT_DIR.iterdir() if path.suffix.lower() in VIDEO_EXTS], key=lambda x: x.name)
+        
+        if not video_files:
+            self.scan_progress_var.set("비디오 파일이 없습니다")
+            return
+            
+        # 병렬 스캔 시작
+        self.scan_progress_var.set(f"파일 스캔 중... (0/{len(video_files)})")
+        self.scan_thread = threading.Thread(target=self._scan_files_parallel, args=(video_files, selected_label))
+        self.scan_thread.start()
 
-        for path in SCRIPT_DIR.iterdir():
-            if path.suffix.lower() in VIDEO_EXTS:
-                pbf = path.with_suffix(PBF_EXT)
-                pbf_chaps_count = len(parse_pbf(pbf)) if pbf.exists() else 0
-                ff_chaps_full = ffprobe_get_chapters(path) 
-                ff_chaps_count = len(ff_chaps_full)
-                ff_audio_streams = ffprobe_get_audio_streams(path) 
-                audio_count = len(ff_audio_streams)
-
-                # Format string for consistent column width
-                # Use max 35 chars for filename, then PBF, Ch, Audio counts
-                filename_display = str(path.name)
-                if len(filename_display) > 35:
-                    filename_display = filename_display[:32] + "..." # Truncate and add ellipsis
-
-                label = (f"{filename_display:<35s} | "
-                         f"{str(pbf_chaps_count) if pbf_chaps_count > 0 else '-':<5s} | "
-                         f"{str(ff_chaps_count) if ff_chaps_count > 0 else '-':<5s} | "
-                         f"{str(audio_count) if audio_count > 0 else '-':<5s}")
+    def _scan_files_parallel(self, video_files: List[Path], selected_label: str = None):
+        """병렬로 파일들을 스캔합니다."""
+        try:
+            # 캐시에서 이미 분석된 파일들 확인
+            uncached_files = []
+            cached_results = {}
+            
+            for video_path in video_files:
+                if video_path in self.file_cache:
+                    cached_results[video_path] = self.file_cache[video_path]
+                else:
+                    uncached_files.append(video_path)
+            
+            if not uncached_files:
+                # 모든 파일이 캐시에 있는 경우, 정렬해서 UI 업데이트
+                self.after(0, lambda: self._update_ui_with_sorted_results(cached_results, video_files, selected_label))
+                self.after(0, lambda: self.scan_progress_var.set("스캔 완료 (캐시 사용)"))
+                return
                 
-                self.files[label] = {
-                    "video": path, 
-                    "pbf": pbf if pbf.exists() else None, 
-                    "ff_chapters_full": ff_chaps_full,
-                    "ff_audio_streams": ff_audio_streams # Store audio stream indices
-                } 
-                self.listbox.insert(tk.END, label)
+            # 병렬 처리로 새 파일들 분석
+            max_workers = min(len(uncached_files), self.cpu_cores.get())
+            completed_count = len(cached_results)
+            all_results = cached_results.copy()
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 작업 제출
+                future_to_path = {executor.submit(analyze_single_video, path): path for path in uncached_files}
+                
+                # 결과 수집
+                for future in as_completed(future_to_path):
+                    path = future_to_path[future]
+                    try:
+                        result = future.result()
+                        self.file_cache[path] = result
+                        all_results[path] = result
+                        completed_count += 1
+                        
+                        # 진행 상황 업데이트
+                        self.after(0, lambda c=completed_count, t=len(video_files): 
+                                 self.scan_progress_var.set(f"파일 스캔 중... ({c}/{t})"))
+                        
+                    except Exception as e:
+                        print(f"Error processing {path}: {e}")
+                        completed_count += 1
+                        self.after(0, lambda c=completed_count, t=len(video_files): 
+                                 self.scan_progress_var.set(f"파일 스캔 중... ({c}/{t})"))
+            
+            # 모든 분석 완료 후 정렬해서 UI 업데이트
+            self.after(0, lambda: self._update_ui_with_sorted_results(all_results, video_files, selected_label))
+            self.after(0, lambda: self.scan_progress_var.set("스캔 완료"))
+            
+        except Exception as e:
+            self.after(0, lambda: self.scan_progress_var.set(f"스캔 오류: {e}"))
+            print(f"Error in parallel scan: {e}")
 
-        # Attempt to re-select the previously selected item (skip header row)
+    def _update_ui_with_results(self, results: Dict[Path, Dict], selected_label: str = None):
+        """캐시된 결과로 UI를 업데이트합니다."""
+        for video_path, data in results.items():
+            self._add_single_file_to_ui(data)
+
+    def _update_ui_with_sorted_results(self, results: Dict[Path, Dict], video_files: List[Path], selected_label: str = None):
+        """정렬된 결과로 UI를 업데이트합니다."""
+        # video_files 순서대로 정렬된 결과 생성
+        for video_path in video_files:
+            if video_path in results:
+                self._add_single_file_to_ui(results[video_path])
+
+    def _add_single_file_to_ui(self, data: Dict[str, Any]):
+        """단일 파일 데이터를 UI에 추가합니다."""
+        video_path = data["video"]
+        filename_display = str(video_path.name)
+        if len(filename_display) > 35:
+            filename_display = filename_display[:32] + "..."
+        
+        label = (f"{filename_display:<35s} | "
+                 f"{str(data['pbf_chaps_count']) if data['pbf_chaps_count'] > 0 else '-':<5s} | "
+                 f"{str(data['ff_chaps_count']) if data['ff_chaps_count'] > 0 else '-':<5s} | "
+                 f"{str(data['audio_count']) if data['audio_count'] > 0 else '-':<5s}")
+        
+        self.files[label] = {
+            "video": video_path,
+            "pbf": data["pbf"],
+            "ff_chapters_full": data["ff_chapters_full"],
+            "ff_audio_streams": data["ff_audio_streams"]
+        }
+        self.listbox.insert(tk.END, label)
+
+    def _restore_selection(self, selected_label: str = None):
+        """이전 선택을 복원합니다."""
         if selected_label:
-            for i in range(1, self.listbox.size()): # Start from 1 to skip header
+            for i in range(1, self.listbox.size()):
                 if self.listbox.get(i) == selected_label:
                     self.listbox.selection_set(i)
-                    self.listbox.activate(i) # Ensure it's active for _on_file_select
+                    self.listbox.activate(i)
                     break
-        else: # If no selection was made before, try to select the first *data* item
-            if self.listbox.size() > 1: # Check if there's at least one data row after header
+        else:
+            if self.listbox.size() > 1:
                 self.listbox.selection_set(1)
                 self.listbox.activate(1)
-        self._on_file_select() # Call _on_file_select to update chapter/result text based on current mode
+        self._on_file_select()
 
 
     def _update_mode_ui(self):
@@ -685,7 +807,7 @@ class VideoToolkitApp(tk.Tk):
             strat = self.trim_strategy.get()
             chapters_raw: List[Dict] = []
             
-            # Use the full chapter list stored during refresh
+            # Use the full chapter list stored during refresh (cached data)
             if strat in ("chapter", "both"): chapters_raw.extend(info['ff_chapters_full'])
             if strat in ("pbf", "both") and info.get('pbf'): chapters_raw.extend(parse_pbf(info['pbf']))
             
@@ -693,7 +815,14 @@ class VideoToolkitApp(tk.Tk):
             sorted_chaps = sorted([{'start': s, 'title': t} for s, t in uniq.items()], key=lambda x: x['start'])
             self._update_chapter_text(sorted_chaps)
 
-            duration = get_video_duration(info['video'])
+            # 비디오 길이는 캐시에서 가져옴 (이미 analyze_single_video에서 계산됨)
+            video_path = info['video']
+            if video_path in self.file_cache and 'duration' in self.file_cache[video_path]:
+                duration = self.file_cache[video_path]['duration']
+            else:
+                # 캐시에 없는 경우에만 계산 (거의 발생하지 않음)
+                duration = get_video_duration(video_path)
+                    
             results: List[Dict] = []
             trimmed_chaps = sorted_chaps[:-1] if self.between_only.get() and len(sorted_chaps) > 1 else sorted_chaps
             for i, c in enumerate(trimmed_chaps, 1):
