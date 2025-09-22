@@ -355,9 +355,11 @@ class VideoToolkitApp(tk.Tk):
                 
                 cmd = [
                     FFMPEG_BIN,
-                    "-i", str(video_path),
                     "-ss", seconds_to_tc(segment['start']),
-                    "-to", seconds_to_tc(segment['end']),
+                    "-i", str(video_path),
+                    "-to", seconds_to_tc(segment['end'] - segment['start']),
+                    "-avoid_negative_ts", "make_zero",
+                    "-fflags", "+genpts",
                 ]
                 
                 # Video stream mapping
